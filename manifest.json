@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "DemonicScans Energy Farmer",
+  "version": "1.3.0",
+  "description": "Automates chapter upvoting on DemonicScans silently in the background with persistent history tracking.",
+  "permissions": [
+    "storage",
+    "cookies",
+    "alarms",
+    "scripting",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "*://*.demonicscans.org/*",
+    "https://demonicscans.org/*",
+    "https://www.demonicscans.org/*"
+  ],
+  "background": {
+    "scripts": ["background.js"],
+    "service_worker": "background.js"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "energy-farmer@demonicscans.org",
+      "strict_min_version": "109.0"
+    }
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Energy Farmer"
+  }
+}
