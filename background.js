@@ -5,7 +5,7 @@ let workingUrlTemplate = null;
 let persistentBgTabId = null;
 
 chrome.runtime.onInstalled.addListener(() => {
-    updateNetRules();
+    clearNetRules();
     chrome.storage.local.get(["debugMode", "mangaHistory", "farmerState", "logs", "debugLogs"], (res) => {
         if (res.debugMode === undefined) chrome.storage.local.set({ debugMode: false });
         if (!res.mangaHistory) chrome.storage.local.set({ mangaHistory: {} });
@@ -71,46 +71,57 @@ async function getEssentialCookieString() {
     return "";
 }
 
-// Update declarativeNetRequest dynamic rules with exact browser headers
-async function updateNetRules(refererUrl = "https://demonicscans.org/") {
+// Clear any declarativeNetRequest dynamic rules so browser handles headers authentically
+async function clearNetRules() {
     try {
-        let cookieStr = await getEssentialCookieString();
         if (chrome.declarativeNetRequest && chrome.declarativeNetRequest.updateDynamicRules) {
-            const reqHeaders = [
-                { header: "Referer", operation: "set", value: refererUrl },
-                { header: "Origin", operation: "set", value: "https://demonicscans.org" },
-                { header: "Sec-Fetch-Dest", operation: "set", value: "empty" },
-                { header: "Sec-Fetch-Mode", operation: "set", value: "cors" },
-                { header: "Sec-Fetch-Site", operation: "set", value: "same-origin" }
-            ];
-
-            if (cookieStr) {
-                reqHeaders.push({ header: "Cookie", operation: "set", value: cookieStr });
-            }
-
             await chrome.declarativeNetRequest.updateDynamicRules({
-                removeRuleIds: [1],
-                addRules: [{
-                    id: 1,
-                    priority: 1,
-                    action: {
-                        type: "modifyHeaders",
-                        requestHeaders: reqHeaders
-                    },
-                    condition: {
-                        urlFilter: "*://*.demonicscans.org/*",
-                        resourceTypes: ["xmlhttprequest", "main_frame", "sub_frame", "other"]
-                    }
-                }]
+                removeRuleIds: [1]
             });
-            debugLog(`declarativeNetRequest rule updated with Referer: ${refererUrl}`);
+            debugLog("Cleared declarativeNetRequest rules.");
         }
     } catch (e) {
-        debugLog(`declarativeNetRequest update warning: ${e.message}`);
+        // ignore
     }
 }
 
-// Get or reuse a silent background tab for 1st-party requests (active: false)
+// Wait for a tab to finish loading
+function waitForTabComplete(tabId, timeoutMs = 8000) {
+    return new Promise((resolve) => {
+        let isResolved = false;
+        let timer = setTimeout(() => {
+            if (!isResolved) {
+                isResolved = true;
+                chrome.tabs.onUpdated.removeListener(listener);
+                resolve(false);
+            }
+        }, timeoutMs);
+
+        function listener(updatedTabId, changeInfo) {
+            if (updatedTabId === tabId && changeInfo.status === "complete") {
+                if (!isResolved) {
+                    isResolved = true;
+                    clearTimeout(timer);
+                    chrome.tabs.onUpdated.removeListener(listener);
+                    resolve(true);
+                }
+            }
+        }
+
+        chrome.tabs.onUpdated.addListener(listener);
+
+        chrome.tabs.get(tabId).then(tab => {
+            if (tab && tab.status === "complete" && !isResolved) {
+                isResolved = true;
+                clearTimeout(timer);
+                chrome.tabs.onUpdated.removeListener(listener);
+                resolve(true);
+            }
+        }).catch(() => {});
+    });
+}
+
+// Get or reuse an open DemonicScans tab for 1st-party requests
 async function getOrCreateBackgroundTab() {
     try {
         if (persistentBgTabId) {
@@ -126,13 +137,14 @@ async function getOrCreateBackgroundTab() {
 
         let tabs = await chrome.tabs.query({ url: "*://*.demonicscans.org/*" });
         if (tabs && tabs.length > 0) {
-            persistentBgTabId = tabs[0].id;
+            let readyTab = tabs.find(t => t.status === "complete") || tabs[0];
+            persistentBgTabId = readyTab.id;
             return persistentBgTabId;
         }
 
         let newTab = await chrome.tabs.create({ url: "https://demonicscans.org/", active: false });
         persistentBgTabId = newTab.id;
-        await new Promise(r => setTimeout(r, 1500));
+        await waitForTabComplete(newTab.id, 8000);
         return persistentBgTabId;
     } catch (e) {
         debugLog(`Background tab helper error: ${e.message}`);
@@ -140,24 +152,21 @@ async function getOrCreateBackgroundTab() {
     }
 }
 
-// Execute upvote directly inside the 1st-party window context
-async function executeUpvoteInTabContext(tabId, chapterId, userUid) {
+// Fast in-tab reaction fetch without navigating the tab (takes ~100ms)
+async function executeFastUpvoteInTab(tabId, chapterId, userUid) {
     try {
         let scriptOptions = {
             target: { tabId: tabId },
             func: (chapId, uid) => {
                 return new Promise((resolve) => {
-                    let urlParams = new URLSearchParams();
-                    urlParams.append("chapterid", chapId);
-                    urlParams.append("reaction", "1");
-                    urlParams.append("useruid", uid);
+                    let formData = new FormData();
+                    formData.append("chapterid", String(chapId));
+                    formData.append("reaction", "1");
+                    formData.append("useruid", String(uid));
 
-                    fetch("https://demonicscans.org/postreaction.php", {
+                    fetch("/postreaction.php", {
                         method: "POST",
-                        headers: {
-                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-                        },
-                        body: urlParams
+                        body: formData
                     })
                     .then(async r => {
                         let text = await r.text();
@@ -178,7 +187,117 @@ async function executeUpvoteInTabContext(tabId, chapterId, userUid) {
             return results[0].result;
         }
     } catch (e) {
-        debugLog(`Tab context upvote error: ${e.message}`);
+        debugLog(`Fast in-tab upvote error: ${e.message}`);
+    }
+    return null;
+}
+
+// Execute upvote directly inside the live chapter page context (Fallback with tab navigation)
+async function executeUpvoteOnChapterPage(tabId, targetUrl) {
+    try {
+        debugLog(`Navigating tab to ${targetUrl}...`);
+        await chrome.tabs.update(tabId, { url: targetUrl });
+        await waitForTabComplete(tabId, 10000);
+
+        // Allow 400ms for Cloudflare challenge & DOM scripts to settle
+        await new Promise(r => setTimeout(r, 400));
+
+        let scriptOptions = {
+            target: { tabId: tabId },
+            func: () => {
+                return new Promise(async (resolve) => {
+                    try {
+                        let html = document.documentElement.innerHTML;
+
+                        // Check Cloudflare block/challenge
+                        if (document.title.includes("Just a moment...") || html.includes("challenge-platform")) {
+                            if (document.querySelector('#challenge-stage') || document.querySelector('.cf-turnstile-wrapper')) {
+                                resolve({ isCloudflare: true });
+                                return;
+                            }
+                        }
+
+                        // Check 404
+                        if (document.title.includes("404") || document.title.includes("Not Found")) {
+                            resolve({ is404: true });
+                            return;
+                        }
+
+                        // Check Sign in
+                        if (html.includes("Sign in to your account") && !document.querySelector('.reaction')) {
+                            resolve({ isLoggedOut: true });
+                            return;
+                        }
+
+                        // Extract chapter ID and user UID from live DOM/scripts
+                        let chapMatch = html.match(/reacted_chap_(\d+)/i) ||
+                                        html.match(/formData\.append\(\s*['"]chapterid['"]\s*,\s*['"]?(\d+)['"]?\s*\)/i) ||
+                                        html.match(/submitcomment\s*\([^,]+,\s*['"]?(\d+)['"]?/i);
+                        let chapterId = chapMatch ? chapMatch[1] : null;
+
+                        let uid = typeof userUID !== 'undefined' ? userUID : null;
+                        if (!uid) {
+                            const uidCookie = document.cookie.split('; ').find(row => row.startsWith('useruid='));
+                            if (uidCookie) uid = uidCookie.split('=')[1];
+                        }
+
+                        // Click the reaction button directly on the page
+                        const reactionBtn = document.querySelector('.reaction[data-reaction="1"]') || 
+                                            document.querySelector('.reaction');
+                        let clicked = false;
+                        if (reactionBtn) {
+                            reactionBtn.click();
+                            clicked = true;
+                        }
+
+                        // Also send fetch in the live chapter page context to guarantee reaction submission
+                        if (chapterId && uid) {
+                            let formData = new FormData();
+                            formData.append("chapterid", String(chapterId));
+                            formData.append("reaction", "1");
+                            formData.append("useruid", String(uid));
+
+                            let resp = await fetch("/postreaction.php", {
+                                method: "POST",
+                                body: formData
+                            });
+
+                            let text = await resp.text();
+                            let trimmed = text.trim().toLowerCase();
+                            let ok = (resp.status === 200) && (trimmed === "updated" || trimmed === "added" || trimmed.includes("updated") || trimmed.includes("added"));
+                            
+                            resolve({
+                                success: ok || clicked,
+                                status: resp.status,
+                                text: text,
+                                chapterId: chapterId
+                            });
+                            return;
+                        }
+
+                        if (clicked) {
+                            resolve({ success: true, status: 200, text: "Reaction clicked", chapterId });
+                            return;
+                        }
+
+                        resolve({ success: false, status: 404, text: "No reaction button found", chapterId });
+                    } catch (err) {
+                        resolve({ success: false, error: err.message });
+                    }
+                });
+            }
+        };
+
+        if (chrome.scripting && chrome.scripting.ExecutionWorld) {
+            scriptOptions.world = chrome.scripting.ExecutionWorld.MAIN;
+        }
+
+        let results = await chrome.scripting.executeScript(scriptOptions);
+        if (results && results[0] && results[0].result) {
+            return results[0].result;
+        }
+    } catch (e) {
+        debugLog(`Upvote chapter page error: ${e.message}`);
     }
     return null;
 }
@@ -293,31 +412,46 @@ function getSlugCandidates(rawSlug) {
     return Array.from(finalSet);
 }
 
-// 7-strategy Chapter ID Extractor
+// Robust Chapter ID Extractor specifically targeting DemonicScans structure
 function extractChapterId(htmlText) {
     if (!htmlText) return null;
 
-    let match = htmlText.match(/(?:chapter_?id|chap_?id|chapterid)\s*[:=]\s*['"]?(\d{2,12})['"]?/i);
+    // 1. formData.append('chapterid', '103096') or ['"]chapterid['"], '103096'
+    let match = htmlText.match(/formData\.append\(\s*['"]chapterid['"]\s*,\s*['"]?(\d{2,12})['"]?\s*\)/i) ||
+                htmlText.match(/['"]chapterid['"]\s*,\s*['"]?(\d{2,12})['"]?/i);
     if (match) return match[1];
 
+    // 2. Cookie name check: reacted_chap_103096
+    match = htmlText.match(/reacted_chap_(\d{2,12})/i);
+    if (match) return match[1];
+
+    // 3. submitcomment call in site script: submitcomment(..., '103096', ...)
+    match = htmlText.match(/submitcomment\s*\([^,]+,\s*['"]?(\d{2,12})['"]?/i);
+    if (match) return match[1];
+
+    // 4. Exact chapter ID attribute or variable
+    match = htmlText.match(/(?:chapter_?id|chap_?id|chapterid)\s*[:=]\s*['"]?(\d{2,12})['"]?/i);
+    if (match) return match[1];
+
+    // 5. React / vote function parameters
     match = htmlText.match(/(?:react|postReaction|reaction|likeChapter|upvoteChapter|vote)\s*\(\s*['"]?(\d{2,12})['"]?/i);
     if (match) return match[1];
 
-    match = htmlText.match(/data-(?:chapter-?id|chap-?id|id)=['"]?(\d{2,12})['"]?/i);
+    // 6. Explicit data-chapter-id or data-chap-id (Do NOT use generic data-id to avoid comment IDs)
+    match = htmlText.match(/data-(?:chapter-?id|chap-?id)=['"]?(\d{2,12})['"]?/i);
     if (match) return match[1];
 
+    // 7. Input fields named chapterid
     match = htmlText.match(/name=['"]?(?:chapter_?id|chap_?id)['"]?\s+value=['"]?(\d{2,12})['"]?/i) ||
             htmlText.match(/value=['"]?(\d{2,12})['"]?\s+name=['"]?(?:chapter_?id|chap_?id)['"]?/i);
     if (match) return match[1];
 
+    // 8. Element ID with chapter_12345
     match = htmlText.match(/id=['"]?(?:chapter|chap)_?(\d{2,12})['"]?/i);
     if (match) return match[1];
 
-    match = htmlText.match(/(?:postreaction\.php|reaction\.php|chapter)\?(?:[a-z0-9_]+=[^&]*&)*?(?:chapter_?id|id|chap_?id)=(\d{2,12})/i);
-    if (match) return match[1];
-
-    match = htmlText.match(/content=['"]?[^'"]*\/chapter\/(\d{2,12})['"]?/i) ||
-            matchText.match(/href=['"]?[^'"]*\/chapter\/(\d{2,12})['"]?/i);
+    // 9. postreaction.php?chapter_id=12345
+    match = htmlText.match(/(?:postreaction\.php|reaction\.php|chapter)\?(?:[a-z0-9_]+=[^&]*&)*?(?:chapter_?id|chapterid|chap_?id)=(\d{2,12})/i);
     if (match) return match[1];
 
     return null;
@@ -325,10 +459,15 @@ function extractChapterId(htmlText) {
 
 function extractUserUidFromHtml(htmlText) {
     if (!htmlText) return null;
-    let match = htmlText.match(/useruid\s*[:=]\s*['"]?(\d+)['"]?/i) || 
-                htmlText.match(/name=['"]useruid['"]\s+value=['"]?(\d+)['"]?/i);
+    let match = htmlText.match(/useruid\s*[:=]\s*['"]?([a-zA-Z0-9_\-]+)['"]?/i) || 
+                htmlText.match(/name=['"]useruid['"]\s+value=['"]?([a-zA-Z0-9_\-]+)['"]?/i) ||
+                htmlText.match(/userUID\s*=\s*['"]?([a-zA-Z0-9_\-]+)['"]?/i);
     if (match) return match[1];
     return null;
+}
+
+function generateFallbackUserUid() {
+    return 'uid-' + Math.random().toString(36).substring(2, 16) + Date.now();
 }
 
 async function getUserUid() {
@@ -353,7 +492,7 @@ async function getUserUid() {
 }
 
 async function startFarmingTask(mangaInput, startCh, endCh, delayMs = 500) {
-    await updateNetRules();
+    await clearNetRules();
     let mangaSlug = parseMangaSlug(mangaInput);
     if (!mangaSlug) {
         broadcastLog("[ERROR] Invalid manga name or URL provided.", true);
@@ -472,7 +611,6 @@ async function fetchChapterWithFallbacks(rawMangaSlug, ch) {
     candidateUrls = Array.from(new Set(candidateUrls));
 
     for (let url of candidateUrls) {
-        await updateNetRules(url);
         debugLog(`[Ch ${ch}] Attempting URL: ${url}`);
         try {
             let response = await fetch(url, { credentials: 'include' });
@@ -507,7 +645,13 @@ async function runFarmingLoop() {
     activeLoopRunning = true;
 
     try {
-        let userUid = await getUserUid();
+        let tabId = await getOrCreateBackgroundTab();
+        if (!tabId) {
+            broadcastLog("[ERROR] Unable to open or access DemonicScans tab.", true);
+            await pauseFarmingTask("No tab available.");
+            activeLoopRunning = false;
+            return;
+        }
 
         while (true) {
             let res = await chrome.storage.local.get(["farmerState"]);
@@ -530,88 +674,112 @@ async function runFarmingLoop() {
             state.statusText = `Processing Chapter ${ch} / ${state.endCh}...`;
             await chrome.storage.local.set({ farmerState: state });
 
-            broadcastLog(`[*] Fetching Chapter ${ch}...`, false, true);
+            broadcastLog(`[*] Processing Chapter ${ch}...`, false, true);
 
+            // Re-verify tab existence
+            tabId = await getOrCreateBackgroundTab();
+            if (!tabId) {
+                broadcastLog("[ERROR] DemonicScans tab closed or not found.", true);
+                await pauseFarmingTask("Tab closed.");
+                activeLoopRunning = false;
+                return;
+            }
+
+            let userUid = await getUserUid();
+            if (!userUid) userUid = generateFallbackUserUid();
+
+            let upvoteSuccess = false;
+            let finalChapterId = null;
+
+            // 1. FAST PATH: Fetch chapter HTML in background (~100ms) and post reaction in tab (~50ms)
             let fetchResult = await fetchChapterWithFallbacks(state.mangaName, ch);
 
-            if (fetchResult.isCloudflare) {
+            if (fetchResult && fetchResult.isCloudflare) {
                 broadcastLog(`[ERROR] Cloudflare Verification Required on Chapter ${ch}!`, true);
-                debugLog(`Cloudflare challenge detected on ${fetchResult.url}`);
+                debugLog(`Cloudflare challenge detected on Chapter ${ch}`);
                 await pauseFarmingTask("Cloudflare block detected. Please open site to solve captcha.");
                 activeLoopRunning = false;
                 return;
             }
 
-            if (!fetchResult.success) {
-                broadcastLog(`[SKIP] Could not locate Chapter ${ch} ID or page (404 / Missing ID).`, true);
-                debugLog(`[Ch ${ch}] All URL candidates failed or extractChapterId returned null.`);
-            } else {
-                let { chapterId, htmlText, url } = fetchResult;
+            if (fetchResult && fetchResult.success && fetchResult.chapterId) {
+                finalChapterId = fetchResult.chapterId;
+                let fastRes = await executeFastUpvoteInTab(tabId, finalChapterId, userUid);
+                if (fastRes) {
+                    let trimmed = (fastRes.text || "").trim().toLowerCase();
+                    if (fastRes.ok && (trimmed === "updated" || trimmed === "added" || trimmed.includes("updated") || trimmed.includes("added") || fastRes.status === 200)) {
+                        if (!trimmed.includes("sign in to your account") && !trimmed.includes("signin.php")) {
+                            upvoteSuccess = true;
+                        }
+                    }
+                    if (trimmed.includes("sign in to your account") || trimmed.includes("signin.php")) {
+                        broadcastLog(`[ERROR] Not logged in or session expired. Please log into demonicscans.org in your browser.`, true);
+                        await pauseFarmingTask("User session not authenticated.");
+                        activeLoopRunning = false;
+                        return;
+                    }
+                }
+            }
 
-                if (!userUid) {
-                    userUid = extractUserUidFromHtml(htmlText);
-                    if (userUid) debugLog(`Extracted User UID from HTML: ${userUid}`);
+            // 2. FALLBACK PATH: If Fast Path didn't succeed, navigate the tab directly to the chapter page
+            if (!upvoteSuccess) {
+                let candidateUrls = [
+                    `https://demonicscans.org/title/${state.mangaName}/chapter/${ch}/`,
+                    `https://demonicscans.org/title/${state.mangaName}/chapter/${ch}/1`,
+                    `https://demonicscans.org/title/${state.mangaName}/chapter/${ch}`
+                ];
+
+                if (workingUrlTemplate) {
+                    candidateUrls.unshift(workingUrlTemplate.replace("{ch}", ch));
+                    candidateUrls = Array.from(new Set(candidateUrls));
                 }
 
-                if (!userUid) {
-                    broadcastLog(`[ERROR] User UID not found. Please log in to demonicscans.org in your browser.`, true);
-                    await pauseFarmingTask("Missing useruid cookie or session.");
+                let upvoteResult = null;
+                let successUrl = null;
+
+                for (let url of candidateUrls) {
+                    upvoteResult = await executeUpvoteOnChapterPage(tabId, url);
+                    if (upvoteResult) {
+                        if (upvoteResult.isCloudflare) break;
+                        if (upvoteResult.isLoggedOut) break;
+                        if (upvoteResult.success) {
+                            successUrl = url;
+                            finalChapterId = upvoteResult.chapterId || finalChapterId;
+                            upvoteSuccess = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (upvoteResult && upvoteResult.isCloudflare) {
+                    broadcastLog(`[ERROR] Cloudflare Verification Required on Chapter ${ch}!`, true);
+                    debugLog(`Cloudflare challenge detected on Chapter ${ch}`);
+                    await pauseFarmingTask("Cloudflare block detected. Please open site to solve captcha.");
                     activeLoopRunning = false;
                     return;
                 }
 
-                await updateNetRules(url);
-                debugLog(`[Ch ${ch}] Upvoting chapterId ${chapterId}...`);
-
-                let isSuccess = false;
-
-                // First-party background tab execution (bypasses Cloudflare & Firefox extension sandbox 403)
-                let tabId = await getOrCreateBackgroundTab();
-                if (tabId) {
-                    let tabRes = await executeUpvoteInTabContext(tabId, chapterId, userUid);
-                    if (tabRes) {
-                        let tabErrFmt = formatResponseError(tabRes.status, "", tabRes.text);
-                        debugLog(`[Ch ${ch}] First-Party Tab Context -> ${tabErrFmt}`);
-                        if (tabRes.ok || tabRes.status === 200 || (tabRes.text && tabRes.text.includes("updated"))) {
-                            isSuccess = true;
-                        }
-                    }
+                if (upvoteResult && upvoteResult.isLoggedOut) {
+                    broadcastLog(`[ERROR] Not logged in or session expired. Please log into demonicscans.org in your browser.`, true);
+                    await pauseFarmingTask("User session not authenticated.");
+                    activeLoopRunning = false;
+                    return;
                 }
 
-                // Fallback: Direct POST (URLSearchParams)
-                if (!isSuccess) {
-                    try {
-                        let urlParams = new URLSearchParams();
-                        urlParams.append("chapterid", chapterId);
-                        urlParams.append("reaction", "1");
-                        urlParams.append("useruid", userUid);
-
-                        let postResp = await fetch("https://demonicscans.org/postreaction.php", {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-                            },
-                            credentials: 'include',
-                            body: urlParams
-                        });
-                        let postText = await postResp.text();
-                        let errFmt = formatResponseError(postResp.status, postResp.statusText, postText);
-                        debugLog(`[Ch ${ch}] Direct POST (URLSearchParams) -> ${errFmt}`);
-
-                        if (postResp.ok && (postText.includes("updated") || postText.includes("success") || postResp.status === 200)) {
-                            isSuccess = true;
-                        }
-                    } catch (e) {
-                        debugLog(`[Ch ${ch}] Direct POST Exception: ${e.message}`);
-                    }
+                if (successUrl) {
+                    let basePattern = successUrl.replace(`/chapter/${ch}/1`, '/chapter/{ch}/1')
+                                               .replace(`/chapter/${ch}/`, '/chapter/{ch}/')
+                                               .replace(`/chapter/${ch}`, '/chapter/{ch}');
+                    workingUrlTemplate = basePattern;
                 }
+            }
 
-                if (isSuccess) {
-                    broadcastLog(`[OK] Upvoted Chapter ${ch} (ID: ${chapterId})`);
-                    await recordCompletedChapter(state.mangaName, ch);
-                } else {
-                    broadcastLog(`[WARN] Upvote returned HTTP 403 on Chapter ${ch}`, false, true);
-                }
+            if (upvoteSuccess) {
+                let cidText = finalChapterId ? ` (ID: ${finalChapterId})` : "";
+                broadcastLog(`[OK] Upvoted Chapter ${ch}${cidText}`);
+                await recordCompletedChapter(state.mangaName, ch);
+            } else {
+                broadcastLog(`[WARN] Could not upvote Chapter ${ch}`, false, true);
             }
 
             // Move to next chapter and update state

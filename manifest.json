@@ -8,6 +8,7 @@
     "cookies",
     "alarms",
     "scripting",
+    "tabs",
     "declarativeNetRequest"
   ],
   "host_permissions": [
